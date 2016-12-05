@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import unittest
+import logging
 
 from pyprint.ClosableObject import close_objects
 from pyprint.NullPrinter import NullPrinter
@@ -281,3 +282,40 @@ class ConfigurationGatheringTest(unittest.TestCase):
                     ['--no-config', '--find-config'],
                     self.log_printer)
                 self.assertEqual(cm.exception.code, 2)
+
+    def test_section_inheritance(self):
+        current_dir = os.path.abspath(os.path.dirname(__file__))
+        test_dir = os.path.join(current_dir, 'section_manager_test_files')
+
+        with change_directory(test_dir):
+            sections, _, _, _ = gather_configuration(
+                lambda *args: True,
+                self.log_printer,
+                arg_list=['-c', 'inherit_coafile'])
+            self.assertEqual(sections['all.python'].defaults, sections['all'])
+            self.assertEqual(sections['all.c']['config'],
+                             sections['default']['config'])
+            self.assertEqual(sections['java.test'].defaults,
+                             sections['default'])
+            self.assertEqual(int(sections['all.python']['max_line_length']),
+                             80)
+            self.assertEqual(sections['all.python.codestyle'].defaults,
+                             sections['all.python'])
+            self.assertEqual(sections['all.java.codestyle'].defaults,
+                             sections['all'])
+
+    def test_default_section_deprecation_warning(self):
+        logger = logging.getLogger()
+
+        with self.assertLogs(logger, 'WARNING') as cm:
+            gather_configuration(lambda *args: True,
+                                 self.log_printer,
+                                 arg_list=[])
+
+        self.assertIn('WARNING', cm.output[0])
+
+        try:
+            with self.assertLogs(logger, 'WARNING') as cm:
+                load_configuration(['--no-config'], self.log_printer)
+        except Exception as e:
+            self.assertIsInstance(e, AssertionError)
