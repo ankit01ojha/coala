@@ -51,8 +51,8 @@ class ConfigurationGatheringTest(unittest.TestCase):
                               '-s'] + self.min_args))
 
         self.assertEqual(
-            str(sections['default']),
-            "Default {bears : 'JavaTestBear', config : " + repr(temporary) +
+            str(sections['cli']),
+            "cli {bears : 'JavaTestBear', config : " + repr(temporary) +
             ", files : '*.java', save : 'True', test : '5'}")
 
         with make_temp() as temporary:
@@ -192,7 +192,9 @@ class ConfigurationGatheringTest(unittest.TestCase):
 
         with open(filename, 'r') as f:
             lines = f.readlines()
-        self.assertEqual(['[Default]\n', 'config = some_bad_filename\n'], lines)
+        self.assertEqual(['[Default]\n',
+                          '[cli]\n',
+                          'config = some_bad_filename\n'], lines)
 
         with self.assertRaises(SystemExit):
             gather_configuration(
@@ -209,6 +211,7 @@ class ConfigurationGatheringTest(unittest.TestCase):
         if os.path.sep == '\\':
             filename = escape(filename, '\\')
         self.assertEqual(['[Default]\n',
+                          '[cli]\n',
                           'config = ' + filename + '\n',
                           '[test]\n',
                           'value = 5\n'], lines)
@@ -250,7 +253,7 @@ class ConfigurationGatheringTest(unittest.TestCase):
                 lambda *args: True,
                 self.log_printer,
                 arg_list=['--find-config'])
-            self.assertEqual(bool(sections['default']['find_config']), True)
+            self.assertEqual(bool(sections['cli']['find_config']), True)
 
     def test_no_config(self):
         current_dir = os.path.abspath(os.path.dirname(__file__))
@@ -264,13 +267,13 @@ class ConfigurationGatheringTest(unittest.TestCase):
             sections, targets = load_configuration(
                 ['--no-config'],
                 self.log_printer)
-            self.assertNotIn('value', sections['default'])
+            self.assertNotIn('value', sections['cli'])
 
             sections, targets = load_configuration(
                 ['--no-config', '-S', 'use_spaces=True'],
                 self.log_printer)
-            self.assertIn('use_spaces', sections['default'])
-            self.assertNotIn('values', sections['default'])
+            self.assertIn('use_spaces', sections['cli'])
+            self.assertNotIn('values', sections['cli'])
 
             with self.assertRaises(SystemExit) as cm:
                 sections, target = load_configuration(
@@ -294,8 +297,6 @@ class ConfigurationGatheringTest(unittest.TestCase):
                 self.log_printer,
                 arg_list=['-c', 'inherit_coafile'])
             self.assertEqual(sections['all.python'].defaults, sections['all'])
-            self.assertEqual(sections['all.c']['config'],
-                             sections['default']['config'])
             self.assertEqual(sections['java.test'].defaults,
                              sections['default'])
             self.assertEqual(int(sections['all.python']['max_line_length']),
