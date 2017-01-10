@@ -6,7 +6,7 @@ from itertools import chain, compress
 import re
 import shutil
 from subprocess import check_call, CalledProcessError, DEVNULL
-from types import MappingProxyType
+from types import MappingProxyType, MethodType
 
 from coalib.bears.LocalBear import LocalBear
 from coala_utils.ContextManagers import make_temp
@@ -144,437 +144,465 @@ def _prepare_options(options, bear_class):
             'Invalid keyword arguments provided: ' +
             ', '.join(repr(s) for s in sorted(superfluous_options)))
 
+    return options
+
+
+class LinterMeta(type):
+
+    def __repr__(cls):
+        return '<{} linter class (wrapping {!r})>'.format(
+            cls.__name__, cls.options['executable'])
+
+
+class LinterBase(LocalBear):
+
+    def __init__(self, *args, **kwargs):
+        self.base = LocalBear(*args, **kwargs)
+
+    def __getattr__(self, name):
+        if name.startswith('__'):
+            raise AttributeError
+        return getattr(self.base, name)
+
+    @classmethod
+    def kind(cls):
+        return LocalBear.kind()
+
+    @staticmethod
+    def generate_config(filename, file):
+        """
+        Generates the content of a config-file the linter-tool might need.
+
+        The contents generated from this function are written to a
+        temporary file and the path is provided inside
+        ``create_arguments()``.
+
+        By default no configuration is generated.
+
+        You can provide additional keyword arguments and defaults. These
+        will be interpreted as required settings that need to be provided
+        through a coafile-section.
+
+        :param filename:
+            The name of the file currently processed.
+        :param file:
+            The contents of the file currently processed.
+        :return:
+            The config-file-contents as a string or ``None``.
+        """
+        return None
+
+    @staticmethod
+    def create_arguments(filename, file, config_file):
+        """
+        Creates the arguments for the linter.
+
+        You can provide additional keyword arguments and defaults. These
+        will be interpreted as required settings that need to be provided
+        through a coafile-section.
+
+        :param filename:
+            The name of the file the linter-tool shall process.
+        :param file:
+            The contents of the file.
+        :param config_file:
+            The path of the config-file if used. ``None`` if unused.
+        :return:
+            A sequence of arguments to feed the linter-tool with.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def get_executable(cls):
+        """
+        Returns the executable of this class.
+
+        :return:
+            The executable name.
+        """
+        return cls.options['executable']
+
+    @classmethod
+    def check_prerequisites(cls):
+        """
+        Checks whether the linter-tool the bear uses is operational.
+
+        :return:
+            True if operational, otherwise a string containing more info.
+        """
+        if shutil.which(cls.get_executable()) is None:
+            return (repr(cls.get_executable()) + ' is not installed.' +
+                    (' ' + cls.options['executable_check_fail_info']
+                     if cls.options['executable_check_fail_info'] else
+                     ''))
+        else:
+            if cls.options['prerequisite_check_command']:
+                try:
+                    check_call(cls.options['prerequisite_check_command'],
+                               stdout=DEVNULL,
+                               stderr=DEVNULL)
+                    return True
+                except (OSError, CalledProcessError):
+                    return cls.options['prerequisite_check_fail_message']
+            return True
+
+    @classmethod
+    def _get_create_arguments_metadata(cls):
+        return FunctionMetadata.from_function(
+            cls.create_arguments,
+            omit={'self', 'filename', 'file', 'config_file'})
+
+    @classmethod
+    def _get_generate_config_metadata(cls):
+        return FunctionMetadata.from_function(
+            cls.generate_config,
+            omit={'filename', 'file'})
+
+    @classmethod
+    def _get_process_output_metadata(cls):
+        metadata = FunctionMetadata.from_function(cls.process_output)
+
+        if cls.options['output_format'] is None:
+            omitted = {'self', 'output', 'filename', 'file'}
+        else:
+            # If a specific output format is provided, function signatures
+            # from process_output functions should not appear in the help.
+            omitted = set(chain(metadata.non_optional_params,
+                                metadata.optional_params))
+
+        metadata.omit = omitted
+        return metadata
+
+    @classmethod
+    def get_metadata(cls):
+        merged_metadata = FunctionMetadata.merge(
+            cls._get_process_output_metadata(),
+            cls._get_generate_config_metadata(),
+            cls._get_create_arguments_metadata())
+        merged_metadata.desc = inspect.getdoc(cls)
+        return merged_metadata
+
+    def _convert_output_regex_match_to_result(self,
+                                              match,
+                                              filename,
+                                              severity_map,
+                                              result_message):
+        """
+        Converts the matched named-groups of ``output_regex`` to an actual
+        ``Result``.
+
+        :param match:
+            The regex match object.
+        :param filename:
+            The name of the file this match belongs to.
+        :param severity_map:
+            The dict to use to map the severity-match to an actual
+            ``RESULT_SEVERITY``.
+        :param result_message:
+            The static message to use for results instead of grabbing it
+            from the executable output via the ``message`` named regex
+            group.
+        """
+        # Pre process the groups
+        groups = match.groupdict()
+
+        if 'severity' in groups:
+            try:
+                groups['severity'] = severity_map[
+                    groups['severity'].lower()]
+            except KeyError:
+                self.warn(
+                    repr(groups['severity']) + ' not found in '
+                    'severity-map. Assuming `RESULT_SEVERITY.NORMAL`.')
+                groups['severity'] = RESULT_SEVERITY.NORMAL
+        else:
+            groups['severity'] = RESULT_SEVERITY.NORMAL
+
+        for variable in ('line', 'column', 'end_line', 'end_column'):
+            groups[variable] = (None
+                                if groups.get(variable, None) is None else
+                                int(groups[variable]))
+
+        if 'origin' in groups:
+            groups['origin'] = '{} ({})'.format(self.__class__.__name__,
+                                                groups['origin'].strip())
+
+        # Construct the result.
+        return Result.from_values(
+            origin=groups.get('origin', self),
+            message=(groups.get('message', '').strip()
+                     if result_message is None else result_message),
+            file=filename,
+            severity=groups['severity'],
+            line=groups['line'],
+            column=groups['column'],
+            end_line=groups['end_line'],
+            end_column=groups['end_column'],
+            additional_info=groups.get('additional_info', '').strip())
+
+    def process_output_corrected(self,
+                                 output,
+                                 filename,
+                                 file,
+                                 diff_severity=RESULT_SEVERITY.NORMAL,
+                                 result_message='Inconsistency found.',
+                                 diff_distance=1):
+        """
+        Processes the executable's output as a corrected file.
+
+        :param output:
+            The output of the program as a string.
+        :param filename:
+            The filename of the file currently being corrected.
+        :param file:
+            The contents of the file currently being corrected.
+        :param diff_severity:
+            The severity to use for generating results.
+        :param result_message:
+            The message to use for generating results.
+        :param diff_distance:
+            Number of unchanged lines that are allowed in between two
+            changed lines so they get yielded as one diff. If a negative
+            distance is given, every change will be yielded as an own diff,
+            even if they are right beneath each other.
+        :return:
+            An iterator returning results containing patches for the
+            file to correct.
+        """
+        for diff in Diff.from_string_arrays(
+            file,
+            output.splitlines(keepends=True)).split_diff(
+                distance=diff_distance):
+            yield Result(self,
+                         result_message,
+                         affected_code=diff.affected_code(filename),
+                         diffs={filename: diff},
+                         severity=diff_severity)
+
+    def process_output_regex(
+            self, output, filename, file, output_regex,
+            severity_map=MappingProxyType({
+                'critical': RESULT_SEVERITY.MAJOR,
+                'c': RESULT_SEVERITY.MAJOR,
+                'fatal': RESULT_SEVERITY.MAJOR,
+                'fail': RESULT_SEVERITY.MAJOR,
+                'f': RESULT_SEVERITY.MAJOR,
+                'error': RESULT_SEVERITY.MAJOR,
+                'err': RESULT_SEVERITY.MAJOR,
+                'e': RESULT_SEVERITY.MAJOR,
+                'warning': RESULT_SEVERITY.NORMAL,
+                'warn': RESULT_SEVERITY.NORMAL,
+                'w': RESULT_SEVERITY.NORMAL,
+                'information': RESULT_SEVERITY.INFO,
+                'info': RESULT_SEVERITY.INFO,
+                'i': RESULT_SEVERITY.INFO,
+                'note': RESULT_SEVERITY.INFO,
+                'suggestion': RESULT_SEVERITY.INFO}),
+            result_message=None):
+        """
+        Processes the executable's output using a regex.
+
+        :param output:
+            The output of the program as a string.
+        :param filename:
+            The filename of the file currently being corrected.
+        :param file:
+            The contents of the file currently being corrected.
+        :param output_regex:
+            The regex to parse the output with. It should use as many
+            of the following named groups (via ``(?P<name>...)``) to
+            provide a good result:
+
+            - line - The line where the issue starts.
+            - column - The column where the issue starts.
+            - end_line - The line where the issue ends.
+            - end_column - The column where the issue ends.
+            - severity - The severity of the issue.
+            - message - The message of the result.
+            - origin - The origin of the issue.
+            - additional_info - Additional info provided by the issue.
+
+            The groups ``line``, ``column``, ``end_line`` and
+            ``end_column`` don't have to match numbers only, they can
+            also match nothing, the generated ``Result`` is filled
+            automatically with ``None`` then for the appropriate
+            properties.
+        :param severity_map:
+            A dict used to map a severity string (captured from the
+            ``output_regex`` with the named group ``severity``) to an
+            actual ``coalib.results.RESULT_SEVERITY`` for a result.
+        :param result_message:
+            The static message to use for results instead of grabbing it
+            from the executable output via the ``message`` named regex
+            group.
+        :return:
+            An iterator returning results.
+        """
+        for match in re.finditer(output_regex, output):
+            yield self._convert_output_regex_match_to_result(
+                match, filename, severity_map=severity_map,
+                result_message=result_message)
+
+    @classmethod
+    @contextmanager
+    def _create_config(cls, filename, file, **kwargs):
+        """
+        Provides a context-manager that creates the config file if the
+        user provides one and cleans it up when done with linting.
+
+        :param filename:
+            The filename of the file.
+        :param file:
+            The file contents.
+        :param kwargs:
+            Section settings passed from ``run()``.
+        :return:
+            A context-manager handling the config-file.
+        """
+        content = cls.generate_config(filename, file, **kwargs)
+        if content is None:
+            yield None
+        else:
+            with make_temp(
+                    suffix=cls.options['config_suffix']) as config_file:
+                with open(config_file, mode='w') as fl:
+                    fl.write(content)
+                yield config_file
+
+    def run(self, filename, file, **kwargs):
+        # Get the **kwargs params to forward to `generate_config()`
+        # (from `_create_config()`).
+        generate_config_kwargs = FunctionMetadata.filter_parameters(
+            self._get_generate_config_metadata(), kwargs)
+
+        with self._create_config(
+                filename,
+                file,
+                **generate_config_kwargs) as config_file:
+            # And now retrieve the **kwargs for `create_arguments()`.
+            create_arguments_kwargs = (
+                FunctionMetadata.filter_parameters(
+                    self._get_create_arguments_metadata(), kwargs))
+
+            args = self.create_arguments(filename, file, config_file,
+                                         **create_arguments_kwargs)
+
+            try:
+                args = tuple(args)
+            except TypeError:
+                self.err('The given arguments '
+                         '{!r} are not iterable.'.format(args))
+                return
+
+            arguments = (self.get_executable(),) + args
+            self.debug("Running '{}'".format(' '.join(arguments)))
+
+            output = run_shell_command(
+                arguments,
+                stdin=''.join(file) if self.options['use_stdin'] else None,
+                cwd=self.get_config_dir())
+
+            output = tuple(compress(
+                output,
+                (self.options['use_stdout'], self.options['use_stderr'])))
+            if len(output) == 1:
+                output = output[0]
+
+            process_output_kwargs = FunctionMetadata.filter_parameters(
+                self._get_process_output_metadata(), kwargs)
+            return self.process_output(output, filename, file,
+                                       **process_output_kwargs)
+
+    def __repr__(self):
+        return '<{} linter object (wrapping {!r}) at {}>'.format(
+            type(self).__name__, self.get_executable(), hex(id(self)))
+
 
 def _create_linter(klass, options):
 
-    _prepare_options(options, klass)
+    klass.name = klass.__name__
+    klass.options = _prepare_options(options, klass)
 
-    class LinterMeta(type):
+    klass.__init__ = LinterBase.__init__
+    for name, member in inspect.getmembers(LinterBase):
+        if not hasattr(klass, name):
+            if isinstance(member, MethodType):
+                member = MethodType(member.__func__, klass)
+            setattr(klass, name, member)
 
-        def __repr__(cls):
-            return '<{} linter class (wrapping {!r})>'.format(
-                cls.__name__, options['executable'])
+    if options['output_format'] is None:
+        # Check if user supplied a `process_output` override.
+        if not callable(getattr(klass, 'process_output', None)):
+            raise ValueError('`process_output` not provided by given '
+                             'class {!r}.'.format(klass.__name__))
+            # No need to assign to `process_output` here, the class mixing
+            # below automatically does that.
+    else:
+        # Prevent people from accidentally defining `process_output`
+        # manually, as this would implicitly override the internally
+        # set-up `process_output`.
+        if hasattr(klass, 'process_output'):
+            raise ValueError('Found `process_output` already defined '
+                             'by class {!r}, but {!r} output-format is '
+                             'specified.'.format(klass.__name__,
+                                                 options['output_format']))
 
-    class LinterBase(LocalBear, metaclass=LinterMeta):
+        if options['output_format'] == 'corrected':
+            _process_output_args = {
+                key: options[key]
+                for key in ('result_message', 'diff_severity',
+                            'diff_distance')
+                if key in options}
 
-        @staticmethod
-        def generate_config(filename, file):
+            klass._processing_function = partialmethod(
+                LinterBase.process_output_corrected, **_process_output_args)
+
+        else:
+            assert options['output_format'] == 'regex'
+
+            _process_output_args = {
+                key: options[key]
+                for key in ('output_regex', 'severity_map',
+                            'result_message')
+                if key in options}
+
+            klass._processing_function = partialmethod(
+                LinterBase.process_output_regex, **_process_output_args)
+
+        def process_output(self, output, filename, file):
             """
-            Generates the content of a config-file the linter-tool might need.
+            Processes the output of the executable and yields results
+            accordingly.
 
-            The contents generated from this function are written to a
-            temporary file and the path is provided inside
-            ``create_arguments()``.
-
-            By default no configuration is generated.
-
-            You can provide additional keyword arguments and defaults. These
-            will be interpreted as required settings that need to be provided
-            through a coafile-section.
-
+            :param output:
+                The output of the executable. This can be either a string
+                or a tuple depending on the usage of ``use_stdout`` and
+                ``use_stderr`` parameters of ``@linter``. If only one of
+                these arguments is ``True``, a string is placed (containing
+                the selected output stream). If both are ``True``, a tuple
+                is placed with ``(stdout, stderr)``.
             :param filename:
                 The name of the file currently processed.
             :param file:
-                The contents of the file currently processed.
-            :return:
-                The config-file-contents as a string or ``None``.
+                The contents of the file (line-splitted).
             """
-            return None
+            if isinstance(output, str):
+                output = (output,)
 
-        @staticmethod
-        def create_arguments(filename, file, config_file):
-            """
-            Creates the arguments for the linter.
+            for string in output:
+                yield from self._processing_function(
+                    string, filename, file)
 
-            You can provide additional keyword arguments and defaults. These
-            will be interpreted as required settings that need to be provided
-            through a coafile-section.
+        klass.process_output = process_output
 
-            :param filename:
-                The name of the file the linter-tool shall process.
-            :param file:
-                The contents of the file.
-            :param config_file:
-                The path of the config-file if used. ``None`` if unused.
-            :return:
-                A sequence of arguments to feed the linter-tool with.
-            """
-            raise NotImplementedError
-
-        @staticmethod
-        def get_executable():
-            """
-            Returns the executable of this class.
-
-            :return:
-                The executable name.
-            """
-            return options['executable']
-
-        @classmethod
-        def check_prerequisites(cls):
-            """
-            Checks whether the linter-tool the bear uses is operational.
-
-            :return:
-                True if operational, otherwise a string containing more info.
-            """
-            if shutil.which(cls.get_executable()) is None:
-                return (repr(cls.get_executable()) + ' is not installed.' +
-                        (' ' + options['executable_check_fail_info']
-                         if options['executable_check_fail_info'] else
-                         ''))
-            else:
-                if options['prerequisite_check_command']:
-                    try:
-                        check_call(options['prerequisite_check_command'],
-                                   stdout=DEVNULL,
-                                   stderr=DEVNULL)
-                        return True
-                    except (OSError, CalledProcessError):
-                        return options['prerequisite_check_fail_message']
-                return True
-
-        @classmethod
-        def _get_create_arguments_metadata(cls):
-            return FunctionMetadata.from_function(
-                cls.create_arguments,
-                omit={'self', 'filename', 'file', 'config_file'})
-
-        @classmethod
-        def _get_generate_config_metadata(cls):
-            return FunctionMetadata.from_function(
-                cls.generate_config,
-                omit={'filename', 'file'})
-
-        @classmethod
-        def _get_process_output_metadata(cls):
-            metadata = FunctionMetadata.from_function(cls.process_output)
-
-            if options['output_format'] is None:
-                omitted = {'self', 'output', 'filename', 'file'}
-            else:
-                # If a specific output format is provided, function signatures
-                # from process_output functions should not appear in the help.
-                omitted = set(chain(metadata.non_optional_params,
-                                    metadata.optional_params))
-
-            metadata.omit = omitted
-            return metadata
-
-        @classmethod
-        def get_metadata(cls):
-            merged_metadata = FunctionMetadata.merge(
-                cls._get_process_output_metadata(),
-                cls._get_generate_config_metadata(),
-                cls._get_create_arguments_metadata())
-            merged_metadata.desc = inspect.getdoc(cls)
-            return merged_metadata
-
-        def _convert_output_regex_match_to_result(self,
-                                                  match,
-                                                  filename,
-                                                  severity_map,
-                                                  result_message):
-            """
-            Converts the matched named-groups of ``output_regex`` to an actual
-            ``Result``.
-
-            :param match:
-                The regex match object.
-            :param filename:
-                The name of the file this match belongs to.
-            :param severity_map:
-                The dict to use to map the severity-match to an actual
-                ``RESULT_SEVERITY``.
-            :param result_message:
-                The static message to use for results instead of grabbing it
-                from the executable output via the ``message`` named regex
-                group.
-            """
-            # Pre process the groups
-            groups = match.groupdict()
-
-            if 'severity' in groups:
-                try:
-                    groups['severity'] = severity_map[
-                        groups['severity'].lower()]
-                except KeyError:
-                    self.warn(
-                        repr(groups['severity']) + ' not found in '
-                        'severity-map. Assuming `RESULT_SEVERITY.NORMAL`.')
-                    groups['severity'] = RESULT_SEVERITY.NORMAL
-            else:
-                groups['severity'] = RESULT_SEVERITY.NORMAL
-
-            for variable in ('line', 'column', 'end_line', 'end_column'):
-                groups[variable] = (None
-                                    if groups.get(variable, None) is None else
-                                    int(groups[variable]))
-
-            if 'origin' in groups:
-                groups['origin'] = '{} ({})'.format(klass.__name__,
-                                                    groups['origin'].strip())
-
-            # Construct the result.
-            return Result.from_values(
-                origin=groups.get('origin', self),
-                message=(groups.get('message', '').strip()
-                         if result_message is None else result_message),
-                file=filename,
-                severity=groups['severity'],
-                line=groups['line'],
-                column=groups['column'],
-                end_line=groups['end_line'],
-                end_column=groups['end_column'],
-                additional_info=groups.get('additional_info', '').strip())
-
-        def process_output_corrected(self,
-                                     output,
-                                     filename,
-                                     file,
-                                     diff_severity=RESULT_SEVERITY.NORMAL,
-                                     result_message='Inconsistency found.',
-                                     diff_distance=1):
-            """
-            Processes the executable's output as a corrected file.
-
-            :param output:
-                The output of the program as a string.
-            :param filename:
-                The filename of the file currently being corrected.
-            :param file:
-                The contents of the file currently being corrected.
-            :param diff_severity:
-                The severity to use for generating results.
-            :param result_message:
-                The message to use for generating results.
-            :param diff_distance:
-                Number of unchanged lines that are allowed in between two
-                changed lines so they get yielded as one diff. If a negative
-                distance is given, every change will be yielded as an own diff,
-                even if they are right beneath each other.
-            :return:
-                An iterator returning results containing patches for the
-                file to correct.
-            """
-            for diff in Diff.from_string_arrays(
-                file,
-                output.splitlines(keepends=True)).split_diff(
-                    distance=diff_distance):
-                yield Result(self,
-                             result_message,
-                             affected_code=diff.affected_code(filename),
-                             diffs={filename: diff},
-                             severity=diff_severity)
-
-        def process_output_regex(
-                self, output, filename, file, output_regex,
-                severity_map=MappingProxyType({
-                    'critical': RESULT_SEVERITY.MAJOR,
-                    'c': RESULT_SEVERITY.MAJOR,
-                    'fatal': RESULT_SEVERITY.MAJOR,
-                    'fail': RESULT_SEVERITY.MAJOR,
-                    'f': RESULT_SEVERITY.MAJOR,
-                    'error': RESULT_SEVERITY.MAJOR,
-                    'err': RESULT_SEVERITY.MAJOR,
-                    'e': RESULT_SEVERITY.MAJOR,
-                    'warning': RESULT_SEVERITY.NORMAL,
-                    'warn': RESULT_SEVERITY.NORMAL,
-                    'w': RESULT_SEVERITY.NORMAL,
-                    'information': RESULT_SEVERITY.INFO,
-                    'info': RESULT_SEVERITY.INFO,
-                    'i': RESULT_SEVERITY.INFO,
-                    'note': RESULT_SEVERITY.INFO,
-                    'suggestion': RESULT_SEVERITY.INFO}),
-                result_message=None):
-            """
-            Processes the executable's output using a regex.
-
-            :param output:
-                The output of the program as a string.
-            :param filename:
-                The filename of the file currently being corrected.
-            :param file:
-                The contents of the file currently being corrected.
-            :param output_regex:
-                The regex to parse the output with. It should use as many
-                of the following named groups (via ``(?P<name>...)``) to
-                provide a good result:
-
-                - line - The line where the issue starts.
-                - column - The column where the issue starts.
-                - end_line - The line where the issue ends.
-                - end_column - The column where the issue ends.
-                - severity - The severity of the issue.
-                - message - The message of the result.
-                - origin - The origin of the issue.
-                - additional_info - Additional info provided by the issue.
-
-                The groups ``line``, ``column``, ``end_line`` and
-                ``end_column`` don't have to match numbers only, they can
-                also match nothing, the generated ``Result`` is filled
-                automatically with ``None`` then for the appropriate
-                properties.
-            :param severity_map:
-                A dict used to map a severity string (captured from the
-                ``output_regex`` with the named group ``severity``) to an
-                actual ``coalib.results.RESULT_SEVERITY`` for a result.
-            :param result_message:
-                The static message to use for results instead of grabbing it
-                from the executable output via the ``message`` named regex
-                group.
-            :return:
-                An iterator returning results.
-            """
-            for match in re.finditer(output_regex, output):
-                yield self._convert_output_regex_match_to_result(
-                    match, filename, severity_map=severity_map,
-                    result_message=result_message)
-
-        if options['output_format'] is None:
-            # Check if user supplied a `process_output` override.
-            if not callable(getattr(klass, 'process_output', None)):
-                raise ValueError('`process_output` not provided by given '
-                                 'class {!r}.'.format(klass.__name__))
-                # No need to assign to `process_output` here, the class mixing
-                # below automatically does that.
-        else:
-            # Prevent people from accidentally defining `process_output`
-            # manually, as this would implicitly override the internally
-            # set-up `process_output`.
-            if hasattr(klass, 'process_output'):
-                raise ValueError('Found `process_output` already defined '
-                                 'by class {!r}, but {!r} output-format is '
-                                 'specified.'.format(klass.__name__,
-                                                     options['output_format']))
-
-            if options['output_format'] == 'corrected':
-                _process_output_args = {
-                    key: options[key]
-                    for key in ('result_message', 'diff_severity',
-                                'diff_distance')
-                    if key in options}
-
-                _processing_function = partialmethod(
-                    process_output_corrected, **_process_output_args)
-
-            else:
-                assert options['output_format'] == 'regex'
-
-                _process_output_args = {
-                    key: options[key]
-                    for key in ('output_regex', 'severity_map',
-                                'result_message')
-                    if key in options}
-
-                _processing_function = partialmethod(
-                    process_output_regex, **_process_output_args)
-
-            def process_output(self, output, filename, file):
-                """
-                Processes the output of the executable and yields results
-                accordingly.
-
-                :param output:
-                    The output of the executable. This can be either a string
-                    or a tuple depending on the usage of ``use_stdout`` and
-                    ``use_stderr`` parameters of ``@linter``. If only one of
-                    these arguments is ``True``, a string is placed (containing
-                    the selected output stream). If both are ``True``, a tuple
-                    is placed with ``(stdout, stderr)``.
-                :param filename:
-                    The name of the file currently processed.
-                :param file:
-                    The contents of the file (line-splitted).
-                """
-                if isinstance(output, str):
-                    output = (output,)
-
-                for string in output:
-                    yield from self._processing_function(
-                        string, filename, file)
-
-        @classmethod
-        @contextmanager
-        def _create_config(cls, filename, file, **kwargs):
-            """
-            Provides a context-manager that creates the config file if the
-            user provides one and cleans it up when done with linting.
-
-            :param filename:
-                The filename of the file.
-            :param file:
-                The file contents.
-            :param kwargs:
-                Section settings passed from ``run()``.
-            :return:
-                A context-manager handling the config-file.
-            """
-            content = cls.generate_config(filename, file, **kwargs)
-            if content is None:
-                yield None
-            else:
-                with make_temp(
-                        suffix=options['config_suffix']) as config_file:
-                    with open(config_file, mode='w') as fl:
-                        fl.write(content)
-                    yield config_file
-
-        def run(self, filename, file, **kwargs):
-            # Get the **kwargs params to forward to `generate_config()`
-            # (from `_create_config()`).
-            generate_config_kwargs = FunctionMetadata.filter_parameters(
-                self._get_generate_config_metadata(), kwargs)
-
-            with self._create_config(
-                    filename,
-                    file,
-                    **generate_config_kwargs) as config_file:
-                # And now retrieve the **kwargs for `create_arguments()`.
-                create_arguments_kwargs = (
-                    FunctionMetadata.filter_parameters(
-                        self._get_create_arguments_metadata(), kwargs))
-
-                args = self.create_arguments(filename, file, config_file,
-                                             **create_arguments_kwargs)
-
-                try:
-                    args = tuple(args)
-                except TypeError:
-                    self.err('The given arguments '
-                             '{!r} are not iterable.'.format(args))
-                    return
-
-                arguments = (self.get_executable(),) + args
-                self.debug("Running '{}'".format(' '.join(arguments)))
-
-                output = run_shell_command(
-                    arguments,
-                    stdin=''.join(file) if options['use_stdin'] else None,
-                    cwd=self.get_config_dir())
-
-                output = tuple(compress(
-                    output,
-                    (options['use_stdout'], options['use_stderr'])))
-                if len(output) == 1:
-                    output = output[0]
-
-                process_output_kwargs = FunctionMetadata.filter_parameters(
-                    self._get_process_output_metadata(), kwargs)
-                return self.process_output(output, filename, file,
-                                           **process_output_kwargs)
-
-        def __repr__(self):
-            return '<{} linter object (wrapping {!r}) at {}>'.format(
-                type(self).__name__, self.get_executable(), hex(id(self)))
+    return klass
 
     # Mixin the linter into the user-defined interface, otherwise
     # `create_arguments` and other methods would be overridden by the
     # default version.
-    result_klass = type(klass.__name__, (klass, LinterBase), {})
-    result_klass.__doc__ = klass.__doc__ or ''
-    return result_klass
+    # result_klass = type(klass.__name__, (klass, LinterBase), {})
+    # result_klass.__doc__ = klass.__doc__ or ''
+    # return result_klass
 
 
 @enforce_signature
