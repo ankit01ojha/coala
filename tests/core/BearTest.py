@@ -94,7 +94,7 @@ class BearTest(unittest.TestCase):
 
         uut = BearWithAnalysis(section, filedict)
 
-        results = uut.execute_task((10, 20), {z: 30})
+        results = uut.execute_task((10, 20), {'z': 30})
 
         self.assertEqual(results, [10, 20, 30])
 
